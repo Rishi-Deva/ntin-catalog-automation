@@ -1,0 +1,18 @@
+# Пример службы systemd для запуска бота на Linux-сервере.
+# Положить в /etc/systemd/system/ntin-bot.service, заменить USER и путь, затем:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ntin-bot
+# Запуск через bash нужен на серверах с включённым SELinux (иначе ошибка 203/EXEC).
+[Unit]
+Description=NTIN helper Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=USER
+WorkingDirectory=/home/USER/ntin
+ExecStart=/usr/bin/bash -c 'cd /home/USER/ntin && exec ./venv/bin/python bot.py'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

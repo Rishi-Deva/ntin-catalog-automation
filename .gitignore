@@ -1,0 +1,14 @@
+.env
+venv/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.xlsx
+base_ntin.csv
+base_ntin_*.csv
+my_ntin*.csv
+payloads*.json
+!examples/base_ntin_example.csv
