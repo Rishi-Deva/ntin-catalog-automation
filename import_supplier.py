@@ -11,6 +11,7 @@
   - не добавляет то, что уже есть в базе (по NTIN), и сообщает о конфликтах по штрихкоду;
   - перед записью делает резервную копию базы рядом с ней.
 
+Принимает Excel и CSV. Если в файле есть колонка source, подпись источника берётся из неё для каждой строки.
 Если колонки найдены неверно, укажите их буквами: --ntin-col H --name-col B --gtin-col D
 После добавления у новых строк обычно нет штрихкода. Чтобы бот находил их по штрихкоду:
   python check_ntin.py --enrich-base      (создаст base_ntin_enriched.csv со штрихкодами из каталога)
@@ -27,6 +28,19 @@ import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 COLS = ["ntin", "gtin", "name", "oktru", "source"]
+
+
+class CsvSheet:
+    """CSV читается так, будто это лист Excel (для поиска колонок и цикла по строкам)."""
+    title = "CSV"
+
+    def __init__(self, path):
+        import csv
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            self.rows = [tuple(r) for r in csv.reader(f)]
+
+    def iter_rows(self, min_row=1, max_row=None, values_only=True):
+        return iter([tuple(c if c != "" else None for c in r) for r in self.rows[min_row - 1:max_row]])
 
 
 def col_index(letter):
@@ -52,7 +66,7 @@ def find_columns(ws, args):
     ntin = col_index(args.ntin_col) if args.ntin_col else find(lambda h: "ntin" in h)
     gtin = col_index(args.gtin_col) if args.gtin_col else find(lambda h: "gtin" in h or "штрих" in h or h in ("ean", "ean13"))
     name = col_index(args.name_col) if args.name_col else find(
-        lambda h: h in ("номенклатура", "наименование", "название", "наименование товара", "товар"))
+        lambda h: h in ("номенклатура", "наименование", "название", "наименование товара", "товар", "name"))
     if name is None:
         name = find(lambda h: ("наименование" in h or "название" in h or "номенклатура" in h) and "каз" not in h)
     # запасной вариант названия (в некоторых строках основной колонки пусто, а название лежит в соседней)
@@ -94,8 +108,11 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
 
-    wb = openpyxl.load_workbook(a.file, data_only=True)
-    ws = wb[a.sheet] if a.sheet else wb.active
+    if a.file.lower().endswith(".csv"):
+        ws = CsvSheet(a.file)
+    else:
+        wb = openpyxl.load_workbook(a.file, data_only=True)
+        ws = wb[a.sheet] if a.sheet else wb.active
     header_row, c_ntin, c_gtin, c_name, c_fallback = find_columns(ws, a)
     letter = openpyxl.utils.get_column_letter
     print(f"Лист «{ws.title}», заголовки в строке {header_row}. Колонки: NTIN={letter(c_ntin + 1)}"
@@ -105,6 +122,8 @@ def main(argv=None):
 
     source = a.source or os.path.splitext(os.path.basename(a.file))[0]
     source = f"{source} ({datetime.now().strftime('%d.%m.%Y')})"
+    head = next(ws.iter_rows(min_row=header_row, max_row=header_row, values_only=True))
+    c_source = next((j for j, h in enumerate(head) if str(h or "").strip().lower() == "source"), None)
     rows, bad = [], []
     for r in ws.iter_rows(min_row=header_row + 1, values_only=True):
         if all(c is None for c in r):
@@ -117,7 +136,7 @@ def main(argv=None):
         if not name and c_fallback is not None and c_fallback < len(r) and r[c_fallback]:
             name = str(r[c_fallback]).strip()
         gtin = clean_gtin(r[c_gtin]) if c_gtin is not None and c_gtin < len(r) else ""
-        rows.append({"ntin": ntin, "gtin": gtin, "name": re.sub(r"\s+", " ", name), "oktru": "", "source": source})
+        rows.append({"ntin": ntin, "gtin": gtin, "name": re.sub(r"\s+", " ", name), "oktru": "", "source": (str(r[c_source]).strip() if c_source is not None and c_source < len(r) and r[c_source] else source)})
 
     new = pd.DataFrame(rows, columns=COLS)
     in_file_dups = int(new.duplicated("ntin").sum())

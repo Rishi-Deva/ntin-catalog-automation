@@ -3,6 +3,7 @@
 
 Запуск из корня репозитория:   python -m unittest discover -s tests -v
 """
+import json
 import os
 import struct
 import subprocess
@@ -137,6 +138,146 @@ class BotLogicTests(unittest.TestCase):
         self.assertIn("первые 5 из 7", replies[-1])
 
 
+class FindByNameTests(unittest.TestCase):
+    """Команда /find: поиск готовых кодов по словам из названия."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        base = os.path.join(self.tmp, "base.csv")
+        pd.DataFrame([
+            ["0200000000011", "", "Бальзам после бритья Avon 100 мл", "", "t"],
+            ["0200000000012", "", "Бальзам для волос Ёлочка 200 мл", "", "t"],
+            ["0200000000013", "", "Гель после бритья Nivea", "", "t"],
+            ["0200000000014", "", "Шампунь отключённый", "", "t"],
+        ] + [["02000000001%02d" % i, "", "Крем для рук Avon №%d" % i, "", "t"] for i in range(20, 32)],
+            columns=["ntin", "gtin", "name", "oktru", "source"]).to_csv(base, index=False)
+        self.deact = {"0200000000014"}
+        self.down = False
+
+        def fetch(codes, debug=False):
+            if self.down:
+                return None
+            return [{"ntin_code": c, "gtin": None, "ntin_isdeactivated": c in self.deact} for c in codes]
+        ck.fetch = fetch
+        self.brain = bot.Brain(bot.connect(os.path.join(self.tmp, "t.db")), admins={1}, allowed={2}, base_path=base)
+
+    def find(self, text, uid=2):
+        msg = {"chat": {"type": "private", "id": uid}, "from": {"id": uid, "first_name": "u"}, "text": text}
+        return self.brain.handle(msg)[0]
+
+    def test_all_words_required_and_case_and_yo_ignored(self):
+        out = self.find("/find БАЛЬЗАМ бритья")
+        self.assertIn("0200000000011", out)
+        self.assertNotIn("0200000000012", out)
+        self.assertIn("0200000000012", self.find("/find елочка"))       # «е» находит «Ё»
+
+    def test_empty_query_asks_what_to_search(self):
+        self.assertIn("Что искать", self.find("/find"))
+        self.assertIn("Напишите, что искать", self.brain.find_by_name("/find")[0])
+
+    def test_nothing_found(self):
+        self.assertIn("Ничего не нашёл", self.find("/find помада"))
+
+    def test_limit_and_hint_to_narrow(self):
+        out = self.find("/find крем рук")
+        self.assertIn("Показываю %d" % bot.FIND_LIMIT, out)
+        self.assertIn("Добавьте ещё слово", out)
+        self.assertEqual(sum(1 for line in out.split("\n") if line.startswith("02000")), bot.FIND_LIMIT)
+
+    def test_deactivated_code_is_not_shown(self):
+        out = self.find("/find шампунь")
+        self.assertNotIn("0200000000014  ", out)
+        self.assertIn("использовать их нельзя", out)
+
+    def test_catalog_down_shows_codes_with_warning(self):
+        self.down = True
+        out = self.find("/find гель бритья")
+        self.assertIn("0200000000013", out)
+        self.assertIn("не проверено", out)
+
+    def test_stranger_cannot_use_find(self):
+        self.assertIn("Нет доступа", self.find("/find крем", uid=99))
+
+
+
+class ButtonTests(unittest.TestCase):
+    """Кнопки под полем ввода и диалог «Найти по названию»."""
+
+    def setUp(self):
+        FindByNameTests.setUp(self)
+        self.brain.admins = {1}
+        self.brain.allowed = {1, 2}
+
+    def say(self, uid, text, **extra):
+        msg = {"chat": {"type": "private", "id": uid}, "from": {"id": uid, "first_name": "u"}, "text": text}
+        msg.update(extra)
+        return self.brain.handle(msg)
+
+    def test_keyboard_for_member_admin_and_stranger(self):
+        member = self.brain.markup_for(2)["keyboard"]
+        self.assertEqual(member[0][0]["text"], bot.BTN_FIND)
+        texts_admin = [b["text"] for row in self.brain.markup_for(1)["keyboard"] for b in row]
+        self.assertIn("📋 Список", texts_admin)
+        self.assertNotIn("📋 Список", [b["text"] for row in member for b in row])
+        self.assertEqual(self.brain.markup_for(99), {"remove_keyboard": True})
+
+    def test_find_button_then_words(self):
+        self.assertIn("Что искать", self.say(2, bot.BTN_FIND)[0])
+        out = self.say(2, "крем рук")[0]
+        self.assertIn("Нашёл по названию", out)
+        self.assertNotIn(2, self.brain.waiting_find)
+
+    def test_state_is_used_once(self):
+        self.say(2, bot.BTN_FIND)
+        self.say(2, "крем рук")
+        self.assertIn("Пришлите фото штрихкода", self.say(2, "ещё слова")[0])
+
+    def test_barcode_after_button_is_a_barcode_not_a_search(self):
+        self.say(2, bot.BTN_FIND)
+        out = self.say(2, GOOD)[0]
+        self.assertNotIn("Нашёл по названию", out)
+        self.assertNotIn("Что искать", out)
+
+    def test_other_button_cancels_waiting(self):
+        self.say(2, bot.BTN_FIND)
+        self.assertIn("Привет", self.say(2, "❓ Помощь")[0])
+        self.assertIn("Пришлите фото штрихкода", self.say(2, "крем рук")[0])
+
+    def test_waiting_expires(self):
+        self.say(2, bot.BTN_FIND)
+        self.brain.waiting_find[2] = bot.time.time() - 1000
+        self.assertIn("Пришлите фото штрихкода", self.say(2, "крем рук")[0])
+
+    def test_admin_buttons(self):
+        self.assertEqual(self.say(1, "📋 Список"), ["Список пуст."])
+        self.assertIn("только для администратора", self.say(2, "📋 Список")[0])
+
+    def test_replies_carry_the_keyboard(self):
+        sent = []
+
+        class FakeTg:
+            def call(self, *a, **k): return {}
+            def load_photo(self, file_id): return b""
+            def send(self, chat_id, text, markup=None): sent.append((chat_id, markup))
+            def send_file(self, *a, **k): pass
+        upd = {"message": {"chat": {"type": "private", "id": 2}, "from": {"id": 2, "first_name": "u"}, "text": "/help"}}
+        bot.process_update(FakeTg(), self.brain, upd)
+        self.assertEqual(sent[-1][1]["keyboard"][0][0]["text"], bot.BTN_FIND)
+        upd["message"]["from"]["id"] = upd["message"]["chat"]["id"] = 99
+        bot.process_update(FakeTg(), self.brain, upd)
+        self.assertEqual(sent[-1][1], {"remove_keyboard": True})
+
+    def test_send_passes_markup_as_json(self):
+        calls = []
+        t = bot.Tg("T")
+        t.call = lambda method, **p: calls.append(p) or {}
+        t.send(1, "привет", markup={"remove_keyboard": True})
+        self.assertEqual(json.loads(calls[0]["reply_markup"]), {"remove_keyboard": True})
+        t.send(1, "без кнопок")
+        self.assertNotIn("reply_markup", calls[1])
+
+
+
 class ImportSupplierTests(unittest.TestCase):
     def test_leading_zero_restored_and_no_duplicates(self):
         import openpyxl
@@ -158,6 +299,71 @@ class ImportSupplierTests(unittest.TestCase):
         self.assertEqual(list(df["name"]), ["Товар один", "Товар два"])
         subprocess.run(cmd, check=True, capture_output=True)    # повторный запуск
         self.assertEqual(len(pd.read_csv(base, dtype=str)), 2)
+
+
+class BaseToolsTests(unittest.TestCase):
+    """Инструменты базы кодов: загрузка партии из CSV, проверка по каталогу, очистка."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.base = os.path.join(self.tmp, "base.csv")
+
+    def write_base(self, rows):
+        pd.DataFrame(rows, columns=["ntin", "gtin", "name", "oktru", "source"]).to_csv(self.base, index=False)
+
+    def test_csv_batch_keeps_row_sources_and_is_idempotent(self):
+        self.write_base([["0200000000001", "", "Старый", "", "Прайс"]])
+        batch = os.path.join(self.tmp, "batch.csv")
+        pd.DataFrame([["0200000000002", "4005808588794", "Новый один", "", "Источник А"],
+                      ["0200000000003", "", "Новый два", "", "Источник Б"]],
+                     columns=["ntin", "gtin", "name", "oktru", "source"]).to_csv(batch, index=False)
+        cmd = [sys.executable, os.path.join(ROOT, "import_supplier.py"), batch, "--source", "Общая", "--base", self.base]
+        subprocess.run(cmd, check=True, capture_output=True)
+        df = pd.read_csv(self.base, dtype=str).fillna("")
+        self.assertEqual(len(df), 3)
+        row = df[df.ntin == "0200000000002"].iloc[0]
+        self.assertEqual(row.gtin, "4005808588794")
+        self.assertTrue(row.source.startswith("Источник А"))
+        subprocess.run(cmd, check=True, capture_output=True)
+        self.assertEqual(len(pd.read_csv(self.base, dtype=str)), 3)
+
+    def test_audit_marks_active_deactivated_and_unknown(self):
+        import audit_base
+        self.write_base([["0200000000011", "", "Активный", "", "А"], ["0200000000012", "", "Отключённый", "", "А"],
+                         ["0200000000013", "", "Неизвестный", "", "Б"]])
+        cat = {"0200000000011": {"ntin_code": "0200000000011", "gtin": "4005808588794", "ntin_isdeactivated": False},
+               "0200000000012": {"ntin_code": "0200000000012", "gtin": None, "ntin_isdeactivated": True}}
+        ck.query_catalog = lambda ntins: ([cat[n] for n in ntins if n in cat], True)
+        out = os.path.join(self.tmp, "audit.csv")
+        audit_base.main(["--base", self.base, "--out", out])
+        st = dict(zip(*[pd.read_csv(out, dtype=str).fillna("")[c] for c in ("ntin", "status")]))
+        self.assertEqual(st, {"0200000000011": "активен", "0200000000012": "отключён", "0200000000013": "нет в каталоге"})
+
+    def test_audit_stops_when_catalog_is_unreachable(self):
+        import audit_base
+        self.write_base([["0200000000011", "", "Активный", "", "А"]])
+        ck.query_catalog = lambda ntins: (None, False)
+        with self.assertRaises(SystemExit):
+            audit_base.main(["--base", self.base, "--out", os.path.join(self.tmp, "audit.csv")])
+
+    def test_clean_keeps_active_fills_barcodes_and_archives_the_rest(self):
+        import clean_base
+        self.write_base([["0200000000021", "", "Активный без штрихкода", "", "А"],
+                         ["0200000000021", "", "Дубль строки", "", "А"],
+                         ["0200000000022", "4005808588794", "Отключённый", "", "А"],
+                         ["0200000000023", "", "Не было в проверке", "", "Б"]])
+        audit = os.path.join(self.tmp, "audit.csv")
+        pd.DataFrame([["0200000000021", "Активный", "А", "активен", "4600104010705", ""],
+                      ["0200000000022", "Отключённый", "А", "отключён", "4005808588794", "4005808588794"]],
+                     columns=["ntin", "name", "source", "status", "gtin_in_catalog", "gtin_in_base"]).to_csv(audit, index=False)
+        out, gone = os.path.join(self.tmp, "clean.csv"), os.path.join(self.tmp, "gone.csv")
+        clean_base.main(["--base", self.base, "--audit", audit, "--out", out, "--inactive-out", gone])
+        clean = pd.read_csv(out, dtype=str).fillna("")
+        self.assertEqual(sorted(clean.ntin), ["0200000000021", "0200000000023"])          # отключённый убран, непроверенный остался
+        self.assertEqual(clean[clean.ntin == "0200000000021"].iloc[0].gtin, "4600104010705")  # штрихкод дописан из каталога
+        self.assertEqual(list(pd.read_csv(gone, dtype=str).ntin), ["0200000000022"])
+        self.assertEqual(len(pd.read_csv(self.base, dtype=str)), 4)                         # исходная база не тронута
+
 
 
 if __name__ == "__main__":

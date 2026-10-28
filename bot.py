@@ -15,12 +15,13 @@ Telegram-бот «штрихкод -> код NTIN» (этап 1).
   BOT_INVITE_CODE=слово-и-цифры-2026          (необязательно: вход по коду; человек пишет боту /join КОД)
 Свой номер каждый видит, написав боту /id.
 
-Команды: /start /help /id /join для всех; /stats /notfound /export /users /remove только для администраторов.
+Кнопки под полем ввода дублируют команды. Команды: /start /help /id /join /find для всех; /stats /notfound /export /users /remove только для администраторов.
 Запуск: python bot.py
 """
 import csv
 import hmac
 import io
+import json
 import logging
 import os
 import re
@@ -58,6 +59,14 @@ TODO_STATUSES = ("NOT_FOUND", "INTERNAL_CODE", "MULTIPLE", "DEACTIVATED")
 MAX_CODES = 5            # штрихкодов за одно сообщение (бот однопоточный)
 BUDGET_SEC = 90          # сколько секунд на проверку одного сообщения
 MAX_DOC_BYTES = 8_000_000
+FIND_LIMIT = 8           # сколько найденных товаров показывать в ответ на /find
+BTN_FIND = "🔎 Найти по названию"
+# надпись на кнопке -> команда (кнопки лежат под полем ввода, нажатие приходит боту обычным сообщением)
+BUTTONS = {BTN_FIND: "/find", "❓ Помощь": "/help", "🆔 Мой номер": "/id",
+           "📋 Список": "/notfound", "📊 Статистика": "/stats", "📥 Экспорт": "/export", "👥 Люди": "/users"}
+MENU_COMMANDS = [{"command": "find", "description": "Найти код по названию"},
+                 {"command": "help", "description": "Как пользоваться"},
+                 {"command": "id", "description": "Мой номер в Telegram"}]
 STATE = {"stop": False, "busy": False, "last_alert": 0.0}
 
 
@@ -76,6 +85,11 @@ def load_env():
 def ascii_digits(text):
     """Полноширинные и арабские цифры -> обычные 0-9 (клавиатуры на телефонах бывают разные)."""
     return "".join(str(unicodedata.decimal(ch)) if ch.isdecimal() and not ch.isascii() else ch for ch in text)
+
+
+def norm_text(s):
+    """Для поиска по названию: нижний регистр, «ё» как «е», лишние пробелы убраны."""
+    return re.sub(r"\s+", " ", str(s).lower().replace("ё", "е")).strip()
 
 
 def gtin_ok(code):
@@ -203,9 +217,12 @@ class Brain:
         self.outbox = []         # сообщения администраторам: [(chat_id, текст)]
         self.stranger_last = {}  # когда последний раз отвечали постороннему: {номер: время}
         self.join_alert = 0.0    # когда последний раз предупреждали админов о переборе кода
+        self.waiting_find = {}   # кто нажал «Найти по названию» и ждёт, что искать: {номер: время}
         base = ck.load_base(base_path)
         self.idx, self.names = ck.base_index(base)
         self.known = {ck.norm(n) for n in base["ntin"]}
+        self.rows = [(str(r.ntin), str(r.gtin), str(r.name)) for r in base.itertuples()]   # для /find
+        self.rows_low = [norm_text(r[2]) for r in self.rows]
 
     # -- поиск кода
     def lookup(self, code):
@@ -289,7 +306,50 @@ class Brain:
                     "Запись сохранена. На следующем этапе бот попросит фото упаковки.")
         if status == "NOT_CHECKED":
             return "⏳ Каталог сейчас не отвечает. Запись сохранена, повторите через несколько минут."
-        return "❌ В каталоге кода нет. Записал в список «нужно зарегистрировать». На следующем этапе бот попросит фото упаковки."
+        return ("❌ В каталоге кода нет. Записал в список «нужно зарегистрировать».\n"
+                "Можно поискать по названию: нажмите кнопку «🔎 Найти по названию» внизу.\n"
+                "На следующем этапе бот попросит фото упаковки.")
+
+    # -- кнопки под полем ввода
+    def markup_for(self, uid):
+        """Постоянные кнопки: у своих сотрудников меню, у чужих убираем старое меню."""
+        if not self.has_access(uid):
+            return {"remove_keyboard": True}
+        rows = [[BTN_FIND], ["❓ Помощь", "🆔 Мой номер"]]
+        if uid in self.admins:
+            rows += [["📋 Список", "📊 Статистика"], ["📥 Экспорт", "👥 Люди"]]
+        return {"keyboard": [[{"text": t} for t in row] for row in rows], "resize_keyboard": True, "is_persistent": True}
+
+    # -- поиск по названию
+    def find_by_name(self, text):
+        """/find слова: ищет готовые коды по словам из названия (нужны все слова), актуальность проверяет по каталогу."""
+        parts = text.split(None, 1)
+        words = norm_text(parts[1]).split() if len(parts) > 1 else []
+        if not words:
+            return ["Напишите, что искать, например:\n/find бальзам после бритья\n"
+                    "Ищу по названию среди готовых кодов. Чем точнее слова (бренд, вид товара, объём), тем лучше."]
+        hits = [r for r, low in zip(self.rows, self.rows_low) if all(w in low for w in words)]
+        if not hits:
+            return ["Ничего не нашёл. Попробуйте меньше слов или другое слово (например, только бренд и вид товара). "
+                    "Если и по штрихкоду кода нет, пришлите фото упаковки администратору."]
+        hits.sort(key=lambda r: (len(r[2]), r[2]))        # короче название обычно точнее
+        shown = hits[:FIND_LIMIT]
+        items = ck.fetch([h[0] for h in shown])
+        note = ""
+        if not items:                                      # каталог не ответил: показываем, но предупреждаем
+            note = "\n(Каталог не ответил, действует ли код, не проверено.)"
+        else:
+            by_n = {ck.norm(it.get("ntin_code")): it for it in items}
+            ok = [h for h in shown if ck.norm(h[0]) in by_n and not by_n[ck.norm(h[0])].get("ntin_isdeactivated")]
+            if len(ok) < len(shown):
+                note = f"\n(Ещё {len(shown) - len(ok)} подходящих кодов в каталоге отключены, их не показываю.)"
+            shown = ok
+        if not shown:
+            return ["Подходящие коды в каталоге отключены, использовать их нельзя. Пришлите фото упаковки администратору." + note]
+        lines = [f"{h[0]}  {h[2]}" for h in shown]
+        head = f"Нашёл по названию: {len(hits)}. Показываю {len(shown)}:" if len(hits) > len(shown) else f"Нашёл по названию: {len(shown)}:"
+        tail = "\nДобавьте ещё слово, чтобы сузить поиск." if len(hits) > FIND_LIMIT else ""
+        return [head + "\n" + "\n".join(lines) + tail + note + "\nПроверьте, что это тот же товар (название, объём, оттенок)."]
 
     # -- сообщения
     def handle(self, msg, photo_loader=None):
@@ -302,6 +362,7 @@ class Brain:
         if uid is None:
             return []
         text = ascii_digits((msg.get("text") or "").strip())
+        text = BUTTONS.get(text, text)          # нажатие кнопки = команда
         cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
 
         if cmd == "/id":
@@ -318,9 +379,20 @@ class Brain:
             log.info("нет доступа: %s %s", uid, uname)
             hint = "\nЕсли у вас есть код приглашения, отправьте: /join КОД" if self.invite else ""
             return [f"Нет доступа. Ваш номер: {uid}. Сообщите его администратору.{hint}"]
+        waiting = self.waiting_find.pop(uid, None)       # любое сообщение сбрасывает режим «жду, что искать»
+        if (waiting and time.time() - waiting < 600 and text and not cmd and not msg.get("photo")
+                and not msg.get("document") and not re.search(r"[0-9]{6,}", text)):
+            return self.find_by_name("/find " + text)
+        if cmd == "/find":
+            if len(text.split(None, 1)) < 2:
+                self.waiting_find[uid] = time.time()
+                return ["🔎 Что искать? Напишите слова из названия одним сообщением, например:\nпомада губная avon\n"
+                        "Чем точнее слова (бренд, вид товара, объём), тем лучше."]
+            return self.find_by_name(text)
         if cmd in ("/start", "/help"):
             return ["Привет! Пришлите фото штрихкода (цифры должны быть видны) или введите цифры.\n"
-                    "Я отвечу, есть ли на этот товар код NTIN. Если код есть, больше ничего делать не нужно."]
+                    "Я отвечу, есть ли на этот товар код NTIN. Если код есть, больше ничего делать не нужно.\n"
+                    "Если штрихкод не находится, нажмите кнопку «🔎 Найти по названию» внизу и напишите слова из названия, например: бальзам после бритья"]
         if cmd in ("/stats", "/notfound", "/export", "/users", "/remove"):
             if uid not in self.admins:
                 return ["Эта команда только для администратора."]
@@ -365,7 +437,7 @@ class Brain:
             return [self.answer_code(uid, uname, codes[0])]
         if re.search(r"[0-9]{8}", text):
             return [self.answer_code(uid, uname, text)]
-        return ["Пришлите фото штрихкода или цифры штрихкода (8, 12, 13 или 14 цифр)."]
+        return ["Пришлите фото штрихкода или цифры штрихкода (8, 12, 13 или 14 цифр).\nИскать по названию: кнопка «🔎 Найти по названию» внизу."]
 
     # -- администратор
     def admin_command(self, cmd, text=""):
@@ -498,10 +570,11 @@ class Tg:
                 time.sleep(min(2 ** attempt, 20))
         return None
 
-    def send(self, chat_id, text):
+    def send(self, chat_id, text, markup=None):
         res = None
+        extra = {"reply_markup": json.dumps(markup, ensure_ascii=False)} if markup else {}
         for chunk in split_text(text):
-            res = self.call("sendMessage", chat_id=chat_id, text=chunk)
+            res = self.call("sendMessage", chat_id=chat_id, text=chunk, **extra)
         return res
 
     def send_file(self, chat_id, name, data, caption=""):
@@ -535,7 +608,7 @@ def process_update(tg, brain, upd):
             if isinstance(reply, tuple):
                 tg.send_file(chat_id, reply[1], reply[2], reply[3])
             else:
-                tg.send(chat_id, reply)
+                tg.send(chat_id, reply, markup=brain.markup_for(uid))
         while brain.outbox:
             chat, text = brain.outbox.pop(0)
             tg.send(chat, text)
@@ -599,6 +672,10 @@ def run():
     tg = Tg(token)
     offset = int(oktru.meta_get(db, "tg_offset", 0))
     log.info("Бот запущен. Доступ: администраторов %s, пользователей %s", len(brain.admins), len(brain.allowed))
+    try:
+        tg.call("setMyCommands", commands=json.dumps(MENU_COMMANDS, ensure_ascii=False))   # меню «/» слева от поля ввода
+    except Exception:
+        log.warning("не удалось задать меню команд")
     signal.signal(signal.SIGTERM, _on_sigterm)
     while not STATE["stop"]:
         try:
