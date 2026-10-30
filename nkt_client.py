@@ -60,11 +60,12 @@ def load_key():
 
 
 class NktClient:
-    def __init__(self, api_key=None, base=BASE, min_interval=0.25, retries=5, timeout=30):
+    def __init__(self, api_key=None, base=BASE, min_interval=None, retries=None, timeout=30):
         self._key = api_key or load_key()
         self.base = base.rstrip("/")
-        self.min_interval = min_interval
-        self.retries = retries
+        # Если каталог отвечает «слишком часто» (HTTP 429), запуск с NKT_MIN_INTERVAL=1 NKT_RETRIES=8 идёт медленнее и терпеливее.
+        self.min_interval = float(os.environ.get("NKT_MIN_INTERVAL", 0.25)) if min_interval is None else min_interval
+        self.retries = int(os.environ.get("NKT_RETRIES", 5)) if retries is None else retries
         self.timeout = timeout
         self._last = 0.0
         self.session = requests.Session()

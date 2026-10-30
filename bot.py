@@ -11,11 +11,11 @@ Telegram-бот «штрихкод -> код NTIN» (этап 1).
 Настройки в файле .env рядом с программой (в чат не присылайте):
   TELEGRAM_BOT_TOKEN=токен от @BotFather
   BOT_ADMIN_USERS=123456789                   (ваш Telegram-номер; можно несколько через запятую)
-  BOT_ALLOWED_USERS=111111111,222222222       (мама и девочки, вручную)
+  BOT_ALLOWED_USERS=111111111,222222222       (сотрудники, вручную)
   BOT_INVITE_CODE=слово-и-цифры-2026          (необязательно: вход по коду; человек пишет боту /join КОД)
 Свой номер каждый видит, написав боту /id.
 
-Кнопки под полем ввода дублируют команды. Команды: /start /help /id /join /find для всех; /stats /notfound /export /users /remove только для администраторов.
+Кнопки под полем ввода дублируют команды. Команды: /start /help /id /join /find для всех; /stats /notfound /export /users /remove /ai /codes /choices /forget /requests /submit /use /go /sendnow /link только для администраторов.
 Запуск: python bot.py
 """
 import csv
@@ -38,6 +38,15 @@ import requests
 
 import check_ntin as ck
 import oktru
+
+try:
+    import ai_flow            # ИИ-помощник «Добавить товар»; без него бот работает как раньше
+except ImportError:
+    ai_flow = None
+try:
+    import submitter          # автоотправка карточек в каталог (включается AI_SUBMIT=1 в .env)
+except ImportError:
+    submitter = None
 from nkt_client import _read_dotenv
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -62,9 +71,13 @@ MAX_DOC_BYTES = 8_000_000
 FIND_LIMIT = 8           # сколько найденных товаров показывать в ответ на /find
 BTN_FIND = "🔎 Найти по названию"
 # надпись на кнопке -> команда (кнопки лежат под полем ввода, нажатие приходит боту обычным сообщением)
-BUTTONS = {BTN_FIND: "/find", "❓ Помощь": "/help", "🆔 Мой номер": "/id",
+BTN_ADD = "➕ Добавить товар"
+BUTTONS = {BTN_FIND: "/find", BTN_ADD: "/add", "❓ Помощь": "/help", "🆔 Мой номер": "/id", "🤖 ИИ": "/ai", "🧾 Коды ИИ": "/codes", "📤 Заявки": "/requests",
+           "✅ Готово": "/done", "✖️ Отмена": "/cancel", "✅ Верно": "/ok", "✏️ Исправить": "/fix", "❌ Нет подходящего": "/none",
+           **{f"✅ №{i}": f"/pick {i}" for i in range(1, 6)},
            "📋 Список": "/notfound", "📊 Статистика": "/stats", "📥 Экспорт": "/export", "👥 Люди": "/users"}
 MENU_COMMANDS = [{"command": "find", "description": "Найти код по названию"},
+                 {"command": "add", "description": "Добавить товар по фото (ИИ)"},
                  {"command": "help", "description": "Как пользоваться"},
                  {"command": "id", "description": "Мой номер в Telegram"}]
 STATE = {"stop": False, "busy": False, "last_alert": 0.0}
@@ -201,6 +214,7 @@ def connect(path=None):
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, user_id INTEGER, user_name TEXT,
         barcode TEXT, status TEXT, ntin TEXT, name TEXT, comment TEXT)""")
     db.execute("CREATE TABLE IF NOT EXISTS members(user_id INTEGER PRIMARY KEY, name TEXT, joined_at TEXT)")
+    db.execute("CREATE TABLE IF NOT EXISTS choices(gtin TEXT PRIMARY KEY, ntin TEXT, name TEXT, user_id INTEGER, user_name TEXT, ts TEXT)")
     db.execute("CREATE INDEX IF NOT EXISTS ix_scans_barcode ON scans(barcode, id)")
     db.execute("CREATE INDEX IF NOT EXISTS ix_scans_ts ON scans(ts)")
     db.commit()
@@ -210,7 +224,7 @@ def connect(path=None):
 class Brain:
     """Вся логика ответов, без обращений к Telegram (так её легко проверять)."""
 
-    def __init__(self, db, admins, allowed, base_path=ck.DEFAULT_BASE, invite=""):
+    def __init__(self, db, admins, allowed, base_path=ck.DEFAULT_BASE, invite="", ai_env=None, photos_dir=None):
         self.db, self.admins, self.allowed = db, set(admins), set(allowed) | set(admins)
         self.invite = (invite or "").strip().lower()
         self.fails = {}          # неудачные попытки ввода кода: {номер: [время, ...]}
@@ -223,8 +237,49 @@ class Brain:
         self.known = {ck.norm(n) for n in base["ntin"]}
         self.rows = [(str(r.ntin), str(r.gtin), str(r.name)) for r in base.itertuples()]   # для /find
         self.rows_low = [norm_text(r[2]) for r in self.rows]
+        self.base_ntins = {ck.digits(r[0]) for r in self.rows}      # коды из нашей базы (проверены по каталогу)
+        self.ai = None           # ИИ-помощник создаётся только если передан ai_env (в тестах и без ИИ его нет)
+        if ai_flow is not None and ai_env is not None:
+            self.ai = ai_flow.AiFlow(self, ai_env, decode_barcode, gtin_ok, photos_dir or os.path.join(HERE, "photos"))
+        self.submitter = None    # автоотправка в каталог: объект есть всегда, когда есть ИИ-помощник, а включена ли она, решает .env
+        if self.ai is not None and submitter is not None:
+            self.submitter = submitter.Submitter(self, ai_env)
 
     # -- поиск кода
+    def in_base(self, ntin):
+        return ck.digits(ntin) in self.base_ntins
+
+    # -- запомненный выбор: «этому штрихкоду соответствует вот этот код»
+    def remember(self, gtin, ntin, name, uid, uname):
+        self.db.execute("INSERT OR REPLACE INTO choices VALUES(?,?,?,?,?,?)",
+                        (gtin, ntin, name or "", uid, uname or "", datetime.now().isoformat(timespec="seconds")))
+        self.db.commit()
+
+    def forget(self, gtin):
+        n = self.db.execute("DELETE FROM choices WHERE gtin=?", (gtin,)).rowcount
+        self.db.commit()
+        return n
+
+    def chosen_use(self, gtin):
+        """Ранее выбранный сотрудником код для штрихкода, если выбранная карточка не отключена. Иначе None."""
+        row = self.db.execute("SELECT ntin, name, user_name, ts FROM choices WHERE gtin=?", (gtin,)).fetchone()
+        if not row:
+            return None
+        ch = {"gtin": gtin, "ntin": row[0], "name": row[1], "who": row[2], "ts": row[3]}
+        items = ck.fetch([ch["ntin"]])
+        for it in items or []:
+            if ck.digits(str(it.get("ntin_code") or "")) == ck.digits(ch["ntin"]) and it.get("ntin_isdeactivated"):
+                return None                       # выбранную карточку с тех пор отключили
+        return ch
+
+    def chosen_text(self, ch, is_admin=False):
+        when = ch["ts"][8:10] + "." + ch["ts"][5:7] if len(ch["ts"]) >= 10 else ""
+        text = (f"✅ Код: {ch['ntin']}\n{ch['name']}\n"
+                f"Этот штрихкод уже сопоставляли: выбор сделал {ch['who'] or 'сотрудник'} {when}. Ничего делать не нужно.")
+        if is_admin:
+            text += f"\nЕсли выбор неверный: /forget {ch['gtin']}"
+        return text
+
     def lookup(self, code):
         if ck.is_internal(code):
             return None, "INTERNAL_CODE", "", "", ""
@@ -289,6 +344,11 @@ class Brain:
             return ("Цифры не прошли проверку: вероятно, ошибка при чтении. "
                     "Введите цифры ещё раз или сфотографируйте штрихкод крупнее и ровнее.")
         ntin, status, _src, comment, name = self.lookup(code)
+        if status in ("NOT_FOUND", "NOT_CHECKED", "MULTIPLE", "DEACTIVATED"):
+            ch = self.chosen_use(code)                # раньше этот штрихкод уже сопоставили с кодом: берём его
+            if ch:
+                self.record(uid, uname, code, "FOUND_CHOICE", ch["ntin"], ch["name"], f"выбор: {ch['who']}")
+                return self.chosen_text(ch, uid in self.admins)
         self.record(uid, uname, code, status, ntin, name, comment)
         nm = f"\n{name}" if name else ""
         if status == "FOUND":
@@ -301,37 +361,84 @@ class Brain:
         if status == "DEACTIVATED":
             extra = f" Замена: {ntin}." if ntin else ""
             return f"⚠️ Карточка отключена.{extra}{nm}\nЗапись сохранена, разберёмся."
+        add = " или «➕ Добавить товар»" if self.ai is not None else ""
         if status == "INTERNAL_CODE":
             return ("ℹ️ Это внутренний магазинный штрихкод (начинается с 2), по нему нельзя искать в каталоге.\n"
-                    "Запись сохранена. На следующем этапе бот попросит фото упаковки.")
+                    f"Запись сохранена. Нажмите «🔎 Найти по названию»{add} и действуйте по подсказкам.")
         if status == "NOT_CHECKED":
             return "⏳ Каталог сейчас не отвечает. Запись сохранена, повторите через несколько минут."
         return ("❌ В каталоге кода нет. Записал в список «нужно зарегистрировать».\n"
-                "Можно поискать по названию: нажмите кнопку «🔎 Найти по названию» внизу.\n"
-                "На следующем этапе бот попросит фото упаковки.")
+                "Можно поискать по названию: нажмите кнопку «🔎 Найти по названию» внизу"
+                + (", а если и так нет, «➕ Добавить товар» и пришлите фото упаковки." if self.ai is not None else "."))
 
     # -- кнопки под полем ввода
     def markup_for(self, uid):
         """Постоянные кнопки: у своих сотрудников меню, у чужих убираем старое меню."""
         if not self.has_access(uid):
             return {"remove_keyboard": True}
-        rows = [[BTN_FIND], ["❓ Помощь", "🆔 Мой номер"]]
+        if self.ai is not None and self.ai.active(uid):
+            return self.ai.markup(uid)
+        rows = [[BTN_FIND] + ([BTN_ADD] if self.ai is not None else []), ["❓ Помощь", "🆔 Мой номер"]]
         if uid in self.admins:
-            rows += [["📋 Список", "📊 Статистика"], ["📥 Экспорт", "👥 Люди"]]
+            rows += [["📋 Список", "📊 Статистика"], ["📥 Экспорт", "👥 Люди"]] + ([["🤖 ИИ", "🧾 Коды ИИ"], ["📤 Заявки"]] if self.ai is not None else [])
         return {"keyboard": [[{"text": t} for t in row] for row in rows], "resize_keyboard": True, "is_persistent": True}
+
+    def tick(self):
+        """Вызывается из главного цикла: ежедневная чистка старых фото."""
+        if self.ai is not None:
+            self.ai.tick()
+        if self.submitter is not None:
+            self.submitter.poll()              # раз в полчаса: статусы отправленных заявок, публикация, сообщения с кодом
 
     # -- поиск по названию
     def find_by_name(self, text):
-        """/find слова: ищет готовые коды по словам из названия (нужны все слова), актуальность проверяет по каталогу."""
+        """/find слова: сначала ищет по всему каталогу (карточки всех продавцов), потом по нашей базе."""
         parts = text.split(None, 1)
         words = norm_text(parts[1]).split() if len(parts) > 1 else []
         if not words:
             return ["Напишите, что искать, например:\n/find бальзам после бритья\n"
-                    "Ищу по названию среди готовых кодов. Чем точнее слова (бренд, вид товара, объём), тем лучше."]
+                    "Ищу по названию среди карточек каталога. Чем точнее слова (бренд, вид товара, объём), тем лучше."]
+        found = self._find_in_catalog(words)
+        if found is not None:
+            return [found]
+        return [self._find_in_base(words, catalog_down=True)]
+
+    def _find_in_catalog(self, words):
+        """Ответ по поиску в открытом каталоге или None (каталог не ответил или ничего не нашёл: тогда смотрим нашу базу)."""
+        cards = ck.search_by_name(" ".join(words), limit=40)
+        if not cards:
+            return None
+        active, seen = [], set()
+        for c in cards:
+            n = ck.digits(c.get("ntin_code"))
+            if not n or c.get("ntin_isdeactivated") or n in seen:
+                continue
+            seen.add(n)
+            active.append(c)
+        if not active:
+            return None
+        strict = [c for c in active if all(w in norm_text(c.get("name_ru") or "") for w in words)]
+        pool, exact = (strict, True) if strict else (active, False)
+        shown = pool[:FIND_LIMIT]
+        lines = []
+        for c in shown:
+            g = ck.clean_gtin(c.get("gtin"))
+            lines.append(f"{ck.digits(c.get('ntin_code'))}  {c.get('name_ru') or '(без названия)'}" + (f"  [штрихкод {g}]" if g else ""))
+        if exact:
+            head = (f"Нашёл в каталоге: {len(pool)}. Показываю {len(shown)}:" if len(pool) > len(shown)
+                    else f"Нашёл в каталоге: {len(shown)}:")
+        else:
+            head = "Точного совпадения по всем словам нет. Похожие карточки каталога:"
+        tail = "\nДобавьте ещё слово, чтобы сузить поиск." if exact and len(pool) > FIND_LIMIT else ""
+        return (head + "\n" + "\n".join(lines) + tail +
+                "\nЭто карточки разных продавцов. Проверьте, что товар тот же (название, объём, оттенок).")
+
+    def _find_in_base(self, words, catalog_down=False):
         hits = [r for r, low in zip(self.rows, self.rows_low) if all(w in low for w in words)]
+        prefix = "(Поиск по всему каталогу ничего не дал или недоступен, смотрю в нашей базе.)\n" if catalog_down else ""
         if not hits:
-            return ["Ничего не нашёл. Попробуйте меньше слов или другое слово (например, только бренд и вид товара). "
-                    "Если и по штрихкоду кода нет, пришлите фото упаковки администратору."]
+            return (prefix + "Ничего не нашёл. Попробуйте меньше слов или другое слово (например, только бренд и вид товара). "
+                    "Если и по штрихкоду кода нет, пришлите фото упаковки администратору.")
         hits.sort(key=lambda r: (len(r[2]), r[2]))        # короче название обычно точнее
         shown = hits[:FIND_LIMIT]
         items = ck.fetch([h[0] for h in shown])
@@ -345,14 +452,14 @@ class Brain:
                 note = f"\n(Ещё {len(shown) - len(ok)} подходящих кодов в каталоге отключены, их не показываю.)"
             shown = ok
         if not shown:
-            return ["Подходящие коды в каталоге отключены, использовать их нельзя. Пришлите фото упаковки администратору." + note]
+            return prefix + "Подходящие коды в каталоге отключены, использовать их нельзя. Пришлите фото упаковки администратору." + note
         lines = [f"{h[0]}  {h[2]}" for h in shown]
         head = f"Нашёл по названию: {len(hits)}. Показываю {len(shown)}:" if len(hits) > len(shown) else f"Нашёл по названию: {len(shown)}:"
         tail = "\nДобавьте ещё слово, чтобы сузить поиск." if len(hits) > FIND_LIMIT else ""
-        return [head + "\n" + "\n".join(lines) + tail + note + "\nПроверьте, что это тот же товар (название, объём, оттенок)."]
+        return prefix + head + "\n" + "\n".join(lines) + tail + note + "\nПроверьте, что это тот же товар (название, объём, оттенок)."
 
     # -- сообщения
-    def handle(self, msg, photo_loader=None):
+    def handle(self, msg, photo_loader=None, notify=None):
         """msg: объект сообщения Telegram. Возвращает список ответов (строки) или ('file', имя, байты, подпись)."""
         chat = msg.get("chat", {})
         if chat.get("type") != "private":
@@ -379,6 +486,10 @@ class Brain:
             log.info("нет доступа: %s %s", uid, uname)
             hint = "\nЕсли у вас есть код приглашения, отправьте: /join КОД" if self.invite else ""
             return [f"Нет доступа. Ваш номер: {uid}. Сообщите его администратору.{hint}"]
+        if self.ai is not None:
+            r = self.ai.handle(uid, uname, msg, text, cmd, photo_loader, notify)
+            if r is not None:
+                return r
         waiting = self.waiting_find.pop(uid, None)       # любое сообщение сбрасывает режим «жду, что искать»
         if (waiting and time.time() - waiting < 600 and text and not cmd and not msg.get("photo")
                 and not msg.get("document") and not re.search(r"[0-9]{6,}", text)):
@@ -392,8 +503,9 @@ class Brain:
         if cmd in ("/start", "/help"):
             return ["Привет! Пришлите фото штрихкода (цифры должны быть видны) или введите цифры.\n"
                     "Я отвечу, есть ли на этот товар код NTIN. Если код есть, больше ничего делать не нужно.\n"
-                    "Если штрихкод не находится, нажмите кнопку «🔎 Найти по названию» внизу и напишите слова из названия, например: бальзам после бритья"]
-        if cmd in ("/stats", "/notfound", "/export", "/users", "/remove"):
+                    "Если штрихкод не находится, нажмите кнопку «🔎 Найти по названию» внизу и напишите слова из названия, например: бальзам после бритья\n"
+                    "Если товара нет и в каталоге, нажмите «➕ Добавить товар» и пришлите фото упаковки: ИИ поищет похожие карточки или подготовит новую."]
+        if cmd in ("/stats", "/notfound", "/export", "/users", "/remove", "/forget", "/choices", "/requests", "/submit", "/use", "/go", "/sendnow", "/link"):
             if uid not in self.admins:
                 return ["Эта команда только для администратора."]
             return self.admin_command(cmd, text)
@@ -448,6 +560,20 @@ class Brain:
                      f"Вошли по коду: {len(rows)}"]
             lines += [f"  {n or '?'} ({i}), {t}" for i, n, t in rows]
             return ["\n".join(lines)]
+        if cmd in ("/requests", "/submit", "/use", "/go", "/sendnow", "/link"):
+            if self.submitter is None:
+                return ["Автоотправка не подключена."]
+            return self.submitter.admin(cmd, text)
+        if cmd == "/forget":
+            g = re.sub(r"\D", "", text or "")
+            if not g:
+                return ["Укажите штрихкод: /forget 4005808588794"]
+            return [f"Выбор для {g} удалён." if self.forget(g) else f"Для {g} сохранённого выбора нет."]
+        if cmd == "/choices":
+            rows = self.db.execute("SELECT gtin, ntin, name, user_name, ts FROM choices ORDER BY ts DESC LIMIT 20").fetchall()
+            if not rows:
+                return ["Сохранённых выборов пока нет."]
+            return ["Последние выборы (штрихкод → код):\n" + "\n".join(f"{g} → {n}  {(nm or '')[:50]}  ({u or '?'}, {t[:10]})" for g, n, nm, u, t in rows)]
         if cmd == "/remove":
             m = re.search(r"[0-9]{1,15}", text)
             if not m:
@@ -593,6 +719,16 @@ class Tg:
         return r.content
 
 
+def flush_outbox(tg, brain):
+    """Отправляет накопленные сообщения (администраторам и тем, кому бот пишет сам: коды, статусы заявок)."""
+    while brain.outbox:
+        chat, text = brain.outbox.pop(0)
+        try:
+            tg.send(chat, text)
+        except Exception:
+            log.exception("не удалось отправить сообщение %s", chat)
+
+
 def process_update(tg, brain, upd):
     msg = upd.get("message")
     if not msg:
@@ -604,14 +740,12 @@ def process_update(tg, brain, upd):
     try:
         if brain.has_access(uid) and (msg.get("photo") or msg.get("document") or msg.get("text")):
             tg.call("sendChatAction", chat_id=chat_id, action="typing")
-        for reply in brain.handle(msg, photo_loader=tg.load_photo):
+        for reply in brain.handle(msg, photo_loader=tg.load_photo, notify=lambda t: tg.send(chat_id, t, markup=brain.markup_for(uid))):
             if isinstance(reply, tuple):
                 tg.send_file(chat_id, reply[1], reply[2], reply[3])
             else:
                 tg.send(chat_id, reply, markup=brain.markup_for(uid))
-        while brain.outbox:
-            chat, text = brain.outbox.pop(0)
-            tg.send(chat, text)
+        flush_outbox(tg, brain)
     except Exception:
         log.exception("ошибка при обработке сообщения")
         tg.send(chat_id, "Что-то пошло не так, попробуйте ещё раз.")
@@ -623,6 +757,11 @@ def process_update(tg, brain, upd):
 
 def poll_once(tg, brain, db, offset):
     """Один круг: получить сообщения и обработать. Возвращает новый offset."""
+    try:
+        brain.tick()
+    except Exception:
+        log.exception("ошибка в фоновых задачах (уборка фото, слежение за заявками)")
+    flush_outbox(tg, brain)
     updates = tg.call("getUpdates", offset=offset, timeout=30, allowed_updates='["message"]')
     if updates is None:
         if tg.last_status == 401:
@@ -666,7 +805,7 @@ def run():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
     db = connect()
     brain = Brain(db, parse_ids(env.get("BOT_ADMIN_USERS")), parse_ids(env.get("BOT_ALLOWED_USERS")),
-                  invite=env.get("BOT_INVITE_CODE", ""))
+                  invite=env.get("BOT_INVITE_CODE", ""), ai_env=env)
     if not brain.admins:
         log.warning("BOT_ADMIN_USERS не задан: напишите боту /id и впишите номер в .env")
     tg = Tg(token)

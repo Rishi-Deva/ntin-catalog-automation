@@ -117,6 +117,29 @@ def fetch(codes, debug=False):
     return None
 
 
+def search_by_name(query, limit=30, offset=0):
+    """Поиск карточек по названию в открытом каталоге (nct.gov.kz, ключ не нужен).
+    Возвращает список карточек ([] если ничего не нашлось) или None, если каталог не ответил."""
+    params = {"q": query, "limit": limit, "offset": offset}
+    for attempt in range(RETRIES):
+        try:
+            r = requests.get(URL, params=params, timeout=TIMEOUT)
+            if r.status_code == 429 or r.status_code >= 500:
+                time.sleep(2 ** attempt)
+                continue
+            if r.status_code >= 400:          # параметры не приняты: повторять бесполезно
+                print(f"  поиск по названию: HTTP {r.status_code}", file=sys.stderr)
+                return None
+            data = r.json()
+            if isinstance(data, dict):
+                data = data.get("result") or data.get("results") or []
+            return data if isinstance(data, list) else []
+        except (requests.RequestException, ValueError) as e:
+            print(f"  ошибка поиска по названию ({attempt + 1}/{RETRIES}): {type(e).__name__}", file=sys.stderr)
+            time.sleep(2 ** attempt)
+    return None
+
+
 def query_catalog(codes, debug=False):
     """Возвращает (карточки, множество успешно проверенных кодов)."""
     items, checked = [], set()

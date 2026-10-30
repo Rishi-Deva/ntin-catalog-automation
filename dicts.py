@@ -109,6 +109,48 @@ def search(db, name, query, limit=10):
     return []
 
 
+def leaves_with_paths(db, name):
+    """[(код, [названия от группы до кода])] для всех конечных кодов справочника.
+    У кодов ТН ВЭД названия без контекста («прочие»), смысл лежит в названиях верхних уровней, поэтому путь собираем по родителям."""
+    rows = db.execute("SELECT id, parent_id, code, has_child, name_ru FROM dict_items WHERE dict=? AND is_deleted=0", (name,)).fetchall()
+    by_id = {r[0]: r for r in rows}
+    out = []
+    for _id, parent, code, has_child, nm in rows:
+        if has_child:
+            continue
+        names, cur = [nm or ""], parent
+        for _ in range(8):
+            if cur not in by_id:
+                break
+            names.append(by_id[cur][4] or "")
+            cur = by_id[cur][1]
+        out.append((code, list(reversed(names))))
+    return out
+
+
+def search_paths(db, name, query, limit=10, leaves=None):
+    """Поиск конечных кодов по словам из ВСЕГО пути (группа > позиция > код). Возвращает [(код, последние три уровня пути)]."""
+    parts = []
+    for w in re.findall(r"[\w-]+", query.lower()):
+        if w in oktru.STOP:
+            continue
+        base, whole = oktru.stem(w)
+        parts.append(re.compile(r"(?<!\w)" + re.escape(base) + (r"(?!\w)" if whole else "")))
+    if not parts:
+        return []
+    leaves = leaves if leaves is not None else leaves_with_paths(db, name)
+    scored = []
+    for code, names in leaves:
+        text = norm_text(" ".join(names))
+        score = sum(1 for rx in parts if rx.search(text))
+        scored.append((score, len(text), code, names))
+    for need in ([len(parts)] + ([len(parts) - 1] if len(parts) > 1 else [])):
+        hits = sorted((x for x in scored if x[0] >= need), key=lambda x: (-x[0], x[1]))
+        if hits:
+            return [(code, " > ".join(names[-3:])[:220]) for _, _, code, names in hits[:limit]]
+    return []
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)

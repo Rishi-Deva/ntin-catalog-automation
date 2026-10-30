@@ -1,5 +1,5 @@
-requests
-pandas
-openpyxl
-numpy
-opencv-python-headless>=4.8
+requests>=2.31
+pandas>=2.0
+openpyxl>=3.1
+opencv-python-headless>=4.8   # чтение штрихкода с фото (без него бот принимает только цифры)
+numpy>=1.24
